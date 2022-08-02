@@ -1,0 +1,323 @@
+---
+title: "hierarchical_bayes_sdt_with_data_sim"
+author: "Emily Mech"
+date: "4/22/2022"
+output: html_document
+---
+# Data Simulation
+### This script simulates data with differing condition effect sizes as well as with different participant level and item level variability.
+
+This data simulation follows the tutorial here: https://github.com/debruine/lmem_sim/blob/master/vignettes/appendix3b_extended_binomial.Rmd
+
+In this task, participants will read a sentence that contains their partner's preference for something.
+- Example stim: "Emily's favorite pizza topping is pepperoni."
+After reading this preference, participants need to respond whether this stated preference is correct for their partner
+ - Participants will respond twice (for correct and incorrect) to 100 items (50 known, 50 unknown)
+
+This is a 2 (known: yes, no) x 2 (correct: yes, no) design 
+Random Factors: 1. Subjects 2. Items (preferences)
+Fixed Factors: 
+ 1. Correctness (level = yes, no)
+    - within subject: same subjects see items (preferences) that are correct and incorrect
+    - within preference: same preferences are both correct and incorrect
+ 2. Knowledge (level = yes, no)
+    - within subject: subjects see both items (preferences) that they know and that they don't
+    - between item (preference): each preference is either known or unknown
+
+Data analysis follows the tutorial here: https://mvuorre.github.io/posts/2017-10-09-bayesian-estimation-of-signal-detection-theory-models/
+```{r setup, include=FALSE}
+library(tidyverse)
+library(faux)
+library(brms)
+library(knitr)
+library(scales)
+library(bayesplot)
+library(ggridges)
+library(sdtalt)
+
+# extra packages allow plotting (not currently implemented)
+
+set.seed(8675309)
+faux_options(verbose = FALSE)
+```
+
+```{r logit functions}
+# functions for logit and inverse logit
+logit <- function(x) { log(x / (1 - x)) }
+
+inv_logit <- function(x) { 1 / (1 + exp(-x)) }
+```
+
+```{r data simulation function}
+# set up the custom data simulation function, defaults are null effects
+simulate_data <- function(
+  n_subj     =  40, # number of subjects
+  n_known    =  50, # number of preferences known
+  n_unknown  =  50, # number of preferences unknown
+  beta_0     =   0, # grand mean - inv_logit(0)=.5
+  beta_c     =   0, # main effect of correctness
+  beta_k     =   0, # main effect of knowledge
+  beta_ck    =   0, # interaction between correctness and knowledge
+  item_0     =   1, # by-item random intercept sd
+  item_c     =   1, # by-item random slope for correctness
+  item_rho   =   0, # by-item random effect correlation
+  subj_0     =   1, # by-subject random intercept sd
+  subj_c     =   1, # by-subject random slope sd for correctness
+  subj_k     =   1, # by-subject random slope sd for knowledge
+  subj_ck    =   1, # by-subject random slope sd for correctness*knowledge
+  # by-subject random effect correlations
+  subj_rho   = c(0, 0, 0, # subj_0  * subj_c, subj_k, subj_ck
+                 0, 0, # subj_e  *         subj_k, subj_kc
+                 0) # subj_c  *                 subj_ck
+) {
+  # simulate items;  separate item ID for each item; 
+  # simulating each item's individual effect for intercept (I_0) 
+  #   and slope (I_e) for expression (the only within-item factor)
+  items <- faux::rnorm_multi(
+    n = n_known + n_unknown,
+    mu = 0, 
+    sd = c(item_0, item_c),
+    r = item_rho,
+    varnames = c("I_0", "I_c")
+  ) %>%
+    mutate(item_id = faux::make_id(nrow(.), "I"),
+           knowledge = rep(c("known", "unknown"), 
+                          c(n_known, n_unknown))) %>%
+    select(item_id, knowledge, everything())
+  
+  # simulate subjects: separate subject ID for each subject; 
+  # simulating each subject's individual effect for intercept (I_0) 
+  #   and slope for each within-subject factor and their interaction.
+  subjects <- faux::rnorm_multi(
+    n = n_subj,
+    mu = 0,
+    sd = c(subj_0, subj_c, subj_k, subj_ck), 
+    r = subj_rho,
+    varnames = c("S_0", "S_c", "S_k", "S_ck")
+  ) %>%
+    mutate(subj_id = faux::make_id(nrow(.), "S")) %>%
+    select(subj_id, everything())
+  
+  # simulate trials
+  crossing(subjects, items,
+           correctness = factor(c("correct", "incorrect"), ordered = TRUE)
+  ) %>%
+    mutate(
+      # effect code the two fixed factors
+      X_c = recode(correctness, "correct" = -0.5, "incorrect" = 0.5),
+      X_k = recode(knowledge, "known" = -0.5, "unknown" = +0.5),
+      # add together fixed and random effects for each effect
+      B_0  = beta_0  + S_0 + I_0,
+      B_c  = beta_c  + S_c + I_c,
+      B_k  = beta_k  + S_k,
+      B_ck = beta_ck + S_ck,
+      # calculate gaussian effect
+      Y = B_0 + (B_c*X_c) + (B_k*X_k) + (B_ck*X_c*X_k),
+      pr = inv_logit(Y), # transform to probability of getting 1
+      Y_bin = rbinom(nrow(.), 1, pr), # sample from bernoulli distribution, ie use pr to set observed binary response to 0 or 1, so if pr = .5, then 0 and 1 equally likely
+      acc = ifelse((X_c == -0.5 & Y_bin == 1) | (X_c == 0.5 & Y_bin == 0), 1, 0)
+    ) %>%
+     mutate(
+    type = "hit",
+    type = ifelse(Y_bin == 0 & X_c == -0.5, "miss", type),
+    type = ifelse(Y_bin == 0 & X_c == 0.5, "cr", type), # Correct rejection
+    type = ifelse(Y_bin == 1 & X_c == 0.5, "fa", type) # False alarm
+  ) %>%
+    select(subj_id, item_id, correctness, knowledge, X_c, X_k, Y, Y_bin, acc, type)
+}
+```
+
+```{r sdt point estimate function}
+sdt_point_estimates <- function(data, filename1, filename2){
+  sdt_null <- data %>% 
+  group_by(subj_id, type) %>%
+  summarise(count = n()) %>%
+  spread(type, count) 
+
+  sdt_null <- sdt_null %>%
+  mutate(
+    zhr = qnorm(hit / (hit + miss)),
+    zfa = qnorm(fa / (fa + cr)),
+    dprime = zhr - zfa,
+    crit = -zfa
+  )
+  
+   if (!is.null(filename1)) {
+    append <- file.exists(filename1) # append if the file exists
+    write_csv(sdt_null, filename1, append = append)
+   }
+  
+  sdt_null_sum <- select(sdt_null, subj_id, dprime, crit) %>% # Select these variables only
+  gather(parameter, value, -subj_id) %>% # Convert data to long format
+  group_by(parameter) %>% # Prepare to summarise on these grouping variables
+  # Calculate summary statistics for grouping variables
+  summarise(n = n(), 
+            mu = mean(value), 
+            sd = sd(value), 
+            se = sd / sqrt(n), 
+            p = (t.test(value, mu = 0)$p.value))
+  
+  if (!is.null(filename2)) {
+    append <- file.exists(filename2) # append if the file exists
+    write_csv(sdt_null_sum, filename2, append = append)
+   }
+}
+```
+
+```{r model sim function}
+sim_models <- function(
+  filename0 = NULL, 
+  filename1=NULL, 
+  filename2=NULL, 
+  filename3=NULL, 
+  filename4=NULL,
+  filename5=NULL,
+  filename6 = NULL,
+  ...) {
+  
+  dat_sim <- simulate_data(...) # generate data
+  
+  if (!is.null(filename0)) {
+    append <- file.exists(filename0) 
+    write_csv(dat_sim, filename0, append = append)
+    } # save the data to review later if desired
+  
+  sdt_point_estimates(dat_sim, filename1, filename2) # save point estimates
+  
+  evsdt_glm <- brm(Y_bin ~ X_c*X_k,
+                   family = bernoulli(link = "probit"),
+                   data = dat_sim,
+                   cores = 7)
+  
+  evsdt_glm_X_c_bf <- hypothesis(evsdt_glm, "X_c = 0.0")
+  evsdt_glm_X_k_bf <- hypothesis(evsdt_glm, "X_k = 0.0")
+  evsdt_glm_X_c_X_k_bf <- hypothesis(evsdt_glm, "X_c:X_k = 0.0")
+  
+  evsdt_glm_bf_df <- rbind(evsdt_glm_X_c_bf$hypothesis,
+                           evsdt_glm_X_k_bf$hypothesis,
+                           evsdt_glm_X_c_X_k_bf$hypothesis)
+  
+  if (!is.null(filename5)) {
+    append <- file.exists(filename5) 
+    write_csv(evsdt_glm_bf_df, filename5, append = append)
+  }
+  
+  nh_sim_results <- broom.mixed::tidy(evsdt_glm$fit)
+  
+  if (!is.null(filename3)) {
+    append <- file.exists(filename3) 
+    write_csv(nh_sim_results, filename3, append = append)
+  } # save the nh estimates
+  
+  evsdt_glmm <- brm(Y_bin ~ 1+ X_c*X_k + 
+                           ( 1 + X_c | item_id) + 
+                           ( 1 + X_c*X_k | subj_id),
+                         family = bernoulli(link = "probit"),
+                         data = dat_sim,
+                         cores = 7,
+                         )
+  evsdt_glmm_X_c_bf <- hypothesis(evsdt_glmm, "X_c = 0.0")
+  evsdt_glmm_X_k_bf <- hypothesis(evsdt_glmm, "X_k = 0.0")
+  evsdt_glmm_X_c_X_k_bf <- hypothesis(evsdt_glmm, "X_c:X_k = 0.0")
+  
+  evsdt_glmm_bf_df <- rbind(evsdt_glmm_X_c_bf$hypothesis,
+                           evsdt_glmm_X_k_bf$hypothesis,
+                           evsdt_glmm_X_c_X_k_bf$hypothesis)
+  
+  if (!is.null(filename6)) {
+    append <- file.exists(filename6) 
+    write_csv(evsdt_glmm_bf_df, filename6, append = append)
+  }
+  
+  hierarchical_sim_results <- broom.mixed::tidy(evsdt_glmm)
+  
+  # append the results to a file if filename is set
+  if (!is.null(filename4)) {
+    append <- file.exists(filename4) # append if the file exists
+    write_csv(hierarchical_sim_results, filename4, append = append)
+  }
+}
+```
+
+```{r filenames}
+# change file names based on effect sizes in data and number of reps
+filename0 <- "../sims/data/simulated_data_sdt_project_null.csv"
+filename1 <- "../sims/sdt_point_estimates/participant_sdt_point_estimates_null.csv"
+filename2 <- "../sims/sdt_point_estimates/population_sdt_point_estimates_null.csv"
+filename3 <- "../sims/non_hierarchical_sdt/evsdt_glm_null_100.csv"
+filename4 <- "../sims/hierarchical_sdt/evsdt_glmm_null_100.csv"
+filename5 <- "../sims/non_hierarchical_sdt/nh_bf/evsdt_glm_null_bf.csv"
+filename6 <- "../sims/hierarchical_sdt/h_bf/evsdt_glmm_null_bf.csv"
+```
+
+```{r run models sims}
+# NOTE - 100 reps takes over 12 hours to run, adjust expectations
+reps <- 100
+
+# run simulations and save to a file
+sims <- purrr::map_df(1:reps, 
+                      ~sim_models(
+                        filename0 = filename0,
+                        filename1 = filename1,
+                        filename2 = filename2,
+                        filename3 = filename3,
+                        filename4 = filename4,
+                        filename5 = filename5,
+                        filename6 = filename6)
+  )
+```
+
+```{r read in model sim results}
+point_estimate_results <- read.csv(filename2)
+hierarchical_significance_results <- read.csv(filename6)
+non_hierarchical_significance_results <- read.csv(filename5)
+```
+
+```{r plot results}
+dprime_point_estimate <- point_estimate_results$mu[point_estimate_results$parameter == "dprime"]
+dprime_glm <- non_hierarchical_significance_results$Estimate[non_hierarchical_significance_results$Hypothesis == "(X_c)-(0.0) = 0"]
+dprime_glmm <- hierarchical_significance_results$Estimate[hierarchical_significance_results$Hypothesis == "(X_c)-(0.0) = 0"]
+Method <- c(rep("point_estimate", 100),
+              rep("glm", 100),
+              rep("glmm", 100))
+experiments <- rep(1:100, 3)
+dprimes <- c(dprime_point_estimate, dprime_glm, dprime_glmm)
+dprime_df <- data.frame(dprimes, Method, experiments)
+
+results_plot <- ggplot(dprime_df, aes(x=experiments, y=dprimes, color=Method)) + 
+  geom_point(size=3) + 
+  scale_color_brewer(palette = "Set1") + 
+  xlab("Replications") + 
+  ylab("d'") +
+  theme_bw()
+
+```
+
+```{r check power}
+alpha <- 0.05
+
+point_est_power <- point_estimate_results %>%
+   dplyr::filter(parameter == "dprime") %>%
+  dplyr::summarise(
+    mean_estimate = mean(mu),
+    power = mean(p < alpha),
+    .groups = "drop"
+  )
+
+nh_est_power <- non_hierarchical_significance_results %>%
+  dplyr::group_by(Hypothesis) %>%
+  dplyr::summarise(
+    mean_estimate = mean(Estimate),
+    power = mean(Star=="*"),
+    .groups = "drop"
+  )
+
+h_est_power <- hierarchical_significance_results %>%
+  dplyr::group_by(Hypothesis) %>%
+  dplyr::summarise(
+    mean_estimate = mean(Estimate),
+    power = mean(Star=="*"),
+    .groups = "drop"
+  )
+```
+
